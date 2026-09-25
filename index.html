@@ -441,6 +441,24 @@
 
   let cloudSyncing = false;
 
+  async function deleteAlbumFromCloud(albumId) {
+    try {
+      const resp = await cloudFetch('/list?perPage=200&orderBy=name&orderDir=asc&query=' + encodeURIComponent('slideshow-' + albumId + '-'));
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const re = new RegExp('^slideshow-' + albumId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '-(\\d+)\\.zip$');
+      const ids = (data.data || []).filter(f => re.test(f.name)).map(f => f.id);
+      if (!ids.length) return;
+      await cloudFetch('/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entryIds: ids })
+      });
+    } catch (e) {
+      console.error('Cloud album delete failed', e);
+    }
+  }
+
   async function cleanupOldCloudBackups(albumId) {
     try {
       const resp = await cloudFetch('/list?perPage=200&orderBy=name&orderDir=asc&query=' + encodeURIComponent('slideshow-' + albumId + '-'));
@@ -729,6 +747,7 @@
         });
         if (!ok) return;
         await dbDelete(album.id);
+        deleteAlbumFromCloud(album.id);
         await loadAlbums();
         showToast('Album deleted');
       });
