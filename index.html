@@ -441,6 +441,28 @@
 
   let cloudSyncing = false;
 
+  async function cleanupOldCloudBackups(albumId) {
+    try {
+      const resp = await cloudFetch('/list?perPage=200&orderBy=name&orderDir=asc&query=' + encodeURIComponent('slideshow-' + albumId + '-'));
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const re = new RegExp('^slideshow-' + albumId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '-(\\d+)\\.zip$');
+      const matches = (data.data || [])
+        .map(f => { const m = f.name.match(re); return m ? { id: f.id, ts: parseInt(m[1], 10) } : null; })
+        .filter(Boolean)
+        .sort((a, b) => b.ts - a.ts);
+      if (matches.length <= 1) return;
+      const staleIds = matches.slice(1).map(m => m.id);
+      await cloudFetch('/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entryIds: staleIds })
+      });
+    } catch (e) {
+      console.error('Cloud cleanup failed (harmless, safe to ignore)', e);
+    }
+  }
+
   async function backupAlbumToCloud(album) {
     try {
       const zipBlob = await buildAlbumZipBlob(album);
@@ -448,6 +470,7 @@
       form.append('file', zipBlob, 'slideshow-' + album.id + '-' + album.updatedAt + '.zip');
       const resp = await cloudFetch('/upload', { method: 'POST', body: form });
       if (!resp.ok) throw new Error('upload-failed');
+      cleanupOldCloudBackups(album.id);
       return true;
     } catch (e) {
       console.error('Cloud backup failed', e);
