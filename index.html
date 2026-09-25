@@ -215,6 +215,7 @@
       <div>
         <h1>Albums</h1>
         <div class="sub" id="albumsSub">Loading…</div>
+        <div class="sub" id="cloudStatus" style="margin-top:2px;">Cloud: not connected</div>
       </div>
       <button class="btn primary" id="newAlbumBtn">New album</button>
     </div>
@@ -348,6 +349,204 @@
   }
 
   function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 9); }
+
+  // ---------------- Cloud sync (private, via Cloudflare Worker + Drime) ----------------
+  const CLOUD_WORKER_URL = 'https://slideshow.scotmorgan621.workers.dev';
+  let cloudPassword = localStorage.getItem('cloudAppPassword') || '';
+  const cloudStatusEl = document.getElementById('cloudStatus');
+
+  function setCloudStatus(text) {
+    if (cloudStatusEl) cloudStatusEl.textContent = 'Cloud: ' + text;
+  }
+
+  async function ensureCloudPassword(forceAsk) {
+    if (cloudPassword && !forceAsk) return cloudPassword;
+    const pw = await openModal({
+      title: 'Cloud sync password',
+      message: 'Enter the password you set for your private cloud storage. It stays only in this browser.',
+      withInput: true,
+      confirmLabel: 'Save'
+    });
+    if (pw) {
+      cloudPassword = pw;
+      localStorage.setItem('cloudAppPassword', pw);
+    }
+    return cloudPassword;
+  }
+
+  async function cloudFetch(path, options) {
+    options = options || {};
+    const pw = await ensureCloudPassword();
+    if (!pw) throw new Error('no-password');
+    const headers = Object.assign({}, options.headers, { 'X-App-Password': pw });
+    const resp = await fetch(CLOUD_WORKER_URL + path, Object.assign({}, options, { headers }));
+    if (resp.status === 401) {
+      localStorage.removeItem('cloudAppPassword');
+      cloudPassword = '';
+      throw new Error('bad-password');
+    }
+    return resp;
+  }
+
+  cloudStatusEl && cloudStatusEl.addEventListener('click', () => ensureCloudPassword(true).then(() => syncWithCloud()));
+  if (cloudStatusEl) { cloudStatusEl.style.cursor = 'pointer'; cloudStatusEl.title = 'Click to change your cloud password or re-sync'; }
+
+  async function buildAlbumZipBlob(album) {
+    const meta = {
+      id: album.id,
+      name: album.name,
+      duration: album.duration,
+      loop: album.loop,
+      shuffle: album.shuffle,
+      updatedAt: album.updatedAt
+    };
+    const metaBlob = new Blob([JSON.stringify(meta)], { type: 'application/json' });
+    const images = album.images || [];
+    const names = uniqueNames(images);
+    const entries = [{ name: '__meta.json', blob: metaBlob }];
+    images.forEach((img, i) => {
+      const prefix = String(i).padStart(5, '0');
+      entries.push({ name: prefix + '__' + names[i], blob: img.blob });
+    });
+    return buildZip(entries);
+  }
+
+  function parseZip(buf) {
+    const view = new DataView(buf);
+    const bytes = new Uint8Array(buf);
+    const entries = [];
+    let offset = 0;
+    while (offset + 4 <= buf.byteLength) {
+      if (view.getUint32(offset, true) !== 0x04034b50) break;
+      const compSize = view.getUint32(offset + 18, true);
+      const nameLen = view.getUint16(offset + 26, true);
+      const extraLen = view.getUint16(offset + 28, true);
+      const nameStart = offset + 30;
+      const name = new TextDecoder('utf-8').decode(bytes.slice(nameStart, nameStart + nameLen));
+      const dataStart = nameStart + nameLen + extraLen;
+      const data = bytes.slice(dataStart, dataStart + compSize);
+      entries.push({ name, data });
+      offset = dataStart + compSize;
+    }
+    return entries;
+  }
+
+  function guessMimeFromName(name) {
+    const m = name.match(/\.([A-Za-z0-9]+)$/);
+    const ext = m ? m[1].toLowerCase() : '';
+    const map = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
+      avif: 'image/avif', bmp: 'image/bmp', svg: 'image/svg+xml', heic: 'image/heic', heif: 'image/heif', tif: 'image/tiff' };
+    return map[ext] || 'application/octet-stream';
+  }
+
+  let cloudSyncing = false;
+
+  async function backupAlbumToCloud(album) {
+    try {
+      const zipBlob = await buildAlbumZipBlob(album);
+      const form = new FormData();
+      form.append('file', zipBlob, 'slideshow-' + album.id + '-' + album.updatedAt + '.zip');
+      const resp = await cloudFetch('/upload', { method: 'POST', body: form });
+      if (!resp.ok) throw new Error('upload-failed');
+      return true;
+    } catch (e) {
+      console.error('Cloud backup failed', e);
+      return false;
+    }
+  }
+
+  async function restoreAlbumFromCloud(hash) {
+    const resp = await cloudFetch('/download/' + hash);
+    if (!resp.ok) throw new Error('download-failed');
+    const buf = await resp.arrayBuffer();
+    const entries = parseZip(buf);
+    let meta = null;
+    const imageEntries = [];
+    entries.forEach(e => {
+      if (e.name === '__meta.json') {
+        meta = JSON.parse(new TextDecoder('utf-8').decode(e.data));
+      } else {
+        imageEntries.push(e);
+      }
+    });
+    if (!meta) throw new Error('no-meta');
+    imageEntries.sort((a, b) => a.name.localeCompare(b.name));
+    const images = imageEntries.map(e => {
+      const idx = e.name.indexOf('__');
+      const origName = idx >= 0 ? e.name.slice(idx + 2) : e.name;
+      return { id: uid(), name: origName, blob: new Blob([e.data], { type: guessMimeFromName(origName) }) };
+    });
+    const album = {
+      id: meta.id,
+      name: meta.name,
+      duration: meta.duration,
+      loop: meta.loop,
+      shuffle: meta.shuffle,
+      images,
+      updatedAt: meta.updatedAt
+    };
+    await dbPut(album);
+    return album;
+  }
+
+  async function syncWithCloud() {
+    if (cloudSyncing) return;
+    cloudSyncing = true;
+    setCloudStatus('syncing…');
+    try {
+      const resp = await cloudFetch('/list?perPage=200&orderBy=name&orderDir=asc');
+      if (!resp.ok) throw new Error('list-failed');
+      const data = await resp.json();
+      const cloudEntries = (data.data || []).filter(f => /^slideshow-.+-\d+\.zip$/.test(f.name));
+      const latestByAlbum = {};
+      cloudEntries.forEach(f => {
+        const m = f.name.match(/^slideshow-(.+)-(\d+)\.zip$/);
+        if (!m) return;
+        const albumId = m[1];
+        const ts = parseInt(m[2], 10);
+        if (!latestByAlbum[albumId] || ts > latestByAlbum[albumId].ts) {
+          latestByAlbum[albumId] = { ts: ts, hash: f.hash };
+        }
+      });
+
+      const localAlbums = await dbGetAll();
+      const localById = Object.fromEntries(localAlbums.map(a => [a.id, a]));
+
+      for (const albumId of Object.keys(latestByAlbum)) {
+        const info = latestByAlbum[albumId];
+        const local = localById[albumId];
+        if (!local || (local.updatedAt || 0) < info.ts) {
+          await restoreAlbumFromCloud(info.hash);
+        }
+      }
+
+      for (const local of localAlbums) {
+        const cloudInfo = latestByAlbum[local.id];
+        if (!cloudInfo || (local.updatedAt || 0) > cloudInfo.ts) {
+          await backupAlbumToCloud(local);
+        }
+      }
+
+      await loadAlbums();
+      setCloudStatus('synced ✓ (private)');
+    } catch (e) {
+      if (e.message === 'no-password') setCloudStatus('not connected — click to set up');
+      else if (e.message === 'bad-password') setCloudStatus('wrong password — click to retry');
+      else { console.error(e); setCloudStatus('sync failed — click to retry'); }
+    } finally {
+      cloudSyncing = false;
+    }
+  }
+
+  let backupDebounceTimer = null;
+  function queueCloudBackup(album) {
+    if (backupDebounceTimer) clearTimeout(backupDebounceTimer);
+    backupDebounceTimer = setTimeout(async () => {
+      setCloudStatus('saving…');
+      const ok = await backupAlbumToCloud(album);
+      setCloudStatus(ok ? 'synced ✓ (private)' : 'save failed — will retry next change');
+    }, 1200);
+  }
 
   let albums = [];
   let currentAlbum = null;
@@ -579,6 +778,7 @@
     currentAlbum.updatedAt = Date.now();
     await dbPut(currentAlbum);
     albumTitle.textContent = currentAlbum.name;
+    queueCloudBackup(currentAlbum);
   });
 
   function renderThumbGrid() {
@@ -607,6 +807,7 @@
       currentAlbum.updatedAt = Date.now();
       await dbPut(currentAlbum);
       renderThumbGrid();
+      queueCloudBackup(currentAlbum);
       return;
     }
     const previewImg = e.target.closest('img[data-preview-id]');
@@ -650,6 +851,7 @@
     }
     renderThumbGrid();
     showToast(files.length + ' image' + (files.length === 1 ? '' : 's') + ' added');
+    queueCloudBackup(currentAlbum);
   }
 
   dropZone.addEventListener('click', () => fileInput.click());
@@ -671,6 +873,7 @@
     currentAlbum.shuffle = shuffleCheckbox.checked;
     currentAlbum.updatedAt = Date.now();
     await dbPut(currentAlbum);
+    queueCloudBackup(currentAlbum);
   }
   durationInput.addEventListener('change', saveSettings);
   loopCheckbox.addEventListener('change', saveSettings);
@@ -977,7 +1180,7 @@
     else if (e.code === 'Escape') exitShow();
   });
 
-  loadAlbums();
+  loadAlbums().then(() => { syncWithCloud(); });
 })();
 </script>
 </body>
