@@ -215,6 +215,7 @@
       <div>
         <h1>Albums</h1>
         <div class="sub" id="albumsSub">Loading…</div>
+        <div class="sub" id="cloudStatus" style="margin-top:2px;">Cloud: not connected</div>
       </div>
       <button class="btn primary" id="newAlbumBtn">New album</button>
     </div>
@@ -327,36 +328,13 @@
     });
   }
 
-  // Updates only succeed if the album still exists, so a stale copy (e.g. from
-  // another tab) can never resurrect a deleted album. Pass { create: true } for new albums.
-  async function dbPut(album, opts) {
-    const create = !!(opts && opts.create);
+  async function dbPut(album) {
     const db = await openDB();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, 'readwrite');
-      const store = tx.objectStore(STORE);
-      let missing = false;
-      if (create) {
-        store.put(album);
-      } else {
-        const getReq = store.get(album.id);
-        getReq.onsuccess = () => {
-          if (getReq.result) store.put(album);
-          else missing = true;
-        };
-      }
-      tx.oncomplete = () => {
-        if (missing) {
-          const err = new Error('Album was deleted');
-          err.code = 'ALBUM_MISSING';
-          reject(err);
-        } else {
-          notifyOtherTabs();
-          resolve();
-        }
-      };
+      tx.objectStore(STORE).put(album);
+      tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -365,17 +343,251 @@
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, 'readwrite');
       tx.objectStore(STORE).delete(id);
-      tx.oncomplete = () => { notifyOtherTabs(); resolve(); };
+      tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error);
     });
   }
 
-  // Let other open tabs know the data changed so they don't work from stale copies.
-  const channel = ('BroadcastChannel' in window) ? new BroadcastChannel('slideshow-albums-sync') : null;
-  function notifyOtherTabs() { try { if (channel) channel.postMessage('changed'); } catch (e) {} }
-
   function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 9); }
+
+  // ---------------- Cloud sync (private, via Cloudflare Worker + Drime) ----------------
+  const CLOUD_WORKER_URL = 'https://slideshow.scotmorgan621.workers.dev';
+  let cloudPassword = localStorage.getItem('cloudAppPassword') || '';
+  const cloudStatusEl = document.getElementById('cloudStatus');
+
+  function setCloudStatus(text) {
+    if (cloudStatusEl) cloudStatusEl.textContent = 'Cloud: ' + text;
+  }
+
+  async function ensureCloudPassword(forceAsk) {
+    if (cloudPassword && !forceAsk) return cloudPassword;
+    const pw = await openModal({
+      title: 'Cloud sync password',
+      message: 'Enter the password you set for your private cloud storage. It stays only in this browser.',
+      withInput: true,
+      confirmLabel: 'Save'
+    });
+    if (pw) {
+      cloudPassword = pw;
+      localStorage.setItem('cloudAppPassword', pw);
+    }
+    return cloudPassword;
+  }
+
+  async function cloudFetch(path, options) {
+    options = options || {};
+    const pw = await ensureCloudPassword();
+    if (!pw) throw new Error('no-password');
+    const headers = Object.assign({}, options.headers, { 'X-App-Password': pw });
+    const resp = await fetch(CLOUD_WORKER_URL + path, Object.assign({}, options, { headers }));
+    if (resp.status === 401) {
+      localStorage.removeItem('cloudAppPassword');
+      cloudPassword = '';
+      throw new Error('bad-password');
+    }
+    return resp;
+  }
+
+  cloudStatusEl && cloudStatusEl.addEventListener('click', () => ensureCloudPassword(true).then(() => syncWithCloud()));
+  if (cloudStatusEl) { cloudStatusEl.style.cursor = 'pointer'; cloudStatusEl.title = 'Click to change your cloud password or re-sync'; }
+
+  async function buildAlbumZipBlob(album) {
+    const meta = {
+      id: album.id,
+      name: album.name,
+      duration: album.duration,
+      loop: album.loop,
+      shuffle: album.shuffle,
+      updatedAt: album.updatedAt
+    };
+    const metaBlob = new Blob([JSON.stringify(meta)], { type: 'application/json' });
+    const images = album.images || [];
+    const names = uniqueNames(images);
+    const entries = [{ name: '__meta.json', blob: metaBlob }];
+    images.forEach((img, i) => {
+      const prefix = String(i).padStart(5, '0');
+      entries.push({ name: prefix + '__' + names[i], blob: img.blob });
+    });
+    return buildZip(entries);
+  }
+
+  function parseZip(buf) {
+    const view = new DataView(buf);
+    const bytes = new Uint8Array(buf);
+    const entries = [];
+    let offset = 0;
+    while (offset + 4 <= buf.byteLength) {
+      if (view.getUint32(offset, true) !== 0x04034b50) break;
+      const compSize = view.getUint32(offset + 18, true);
+      const nameLen = view.getUint16(offset + 26, true);
+      const extraLen = view.getUint16(offset + 28, true);
+      const nameStart = offset + 30;
+      const name = new TextDecoder('utf-8').decode(bytes.slice(nameStart, nameStart + nameLen));
+      const dataStart = nameStart + nameLen + extraLen;
+      const data = bytes.slice(dataStart, dataStart + compSize);
+      entries.push({ name, data });
+      offset = dataStart + compSize;
+    }
+    return entries;
+  }
+
+  function guessMimeFromName(name) {
+    const m = name.match(/\.([A-Za-z0-9]+)$/);
+    const ext = m ? m[1].toLowerCase() : '';
+    const map = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
+      avif: 'image/avif', bmp: 'image/bmp', svg: 'image/svg+xml', heic: 'image/heic', heif: 'image/heif', tif: 'image/tiff' };
+    return map[ext] || 'application/octet-stream';
+  }
+
+  let cloudSyncing = false;
+
+  async function deleteAlbumFromCloud(albumId) {
+    try {
+      const resp = await cloudFetch('/list?perPage=200&orderBy=name&orderDir=asc&query=' + encodeURIComponent('slideshow-' + albumId + '-'));
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const re = new RegExp('^slideshow-' + albumId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '-(\\d+)\\.zip$');
+      const ids = (data.data || []).filter(f => re.test(f.name)).map(f => f.id);
+      if (!ids.length) return;
+      await cloudFetch('/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entryIds: ids })
+      });
+    } catch (e) {
+      console.error('Cloud album delete failed', e);
+    }
+  }
+
+  async function cleanupOldCloudBackups(albumId) {
+    try {
+      const resp = await cloudFetch('/list?perPage=200&orderBy=name&orderDir=asc&query=' + encodeURIComponent('slideshow-' + albumId + '-'));
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const re = new RegExp('^slideshow-' + albumId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '-(\\d+)\\.zip$');
+      const matches = (data.data || [])
+        .map(f => { const m = f.name.match(re); return m ? { id: f.id, ts: parseInt(m[1], 10) } : null; })
+        .filter(Boolean)
+        .sort((a, b) => b.ts - a.ts);
+      if (matches.length <= 1) return;
+      const staleIds = matches.slice(1).map(m => m.id);
+      await cloudFetch('/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ entryIds: staleIds })
+      });
+    } catch (e) {
+      console.error('Cloud cleanup failed (harmless, safe to ignore)', e);
+    }
+  }
+
+  async function backupAlbumToCloud(album) {
+    try {
+      const zipBlob = await buildAlbumZipBlob(album);
+      const form = new FormData();
+      form.append('file', zipBlob, 'slideshow-' + album.id + '-' + album.updatedAt + '.zip');
+      const resp = await cloudFetch('/upload', { method: 'POST', body: form });
+      if (!resp.ok) throw new Error('upload-failed');
+      cleanupOldCloudBackups(album.id);
+      return true;
+    } catch (e) {
+      console.error('Cloud backup failed', e);
+      return false;
+    }
+  }
+
+  async function restoreAlbumFromCloud(hash) {
+    const resp = await cloudFetch('/download/' + hash);
+    if (!resp.ok) throw new Error('download-failed');
+    const buf = await resp.arrayBuffer();
+    const entries = parseZip(buf);
+    let meta = null;
+    const imageEntries = [];
+    entries.forEach(e => {
+      if (e.name === '__meta.json') {
+        meta = JSON.parse(new TextDecoder('utf-8').decode(e.data));
+      } else {
+        imageEntries.push(e);
+      }
+    });
+    if (!meta) throw new Error('no-meta');
+    imageEntries.sort((a, b) => a.name.localeCompare(b.name));
+    const images = imageEntries.map(e => {
+      const idx = e.name.indexOf('__');
+      const origName = idx >= 0 ? e.name.slice(idx + 2) : e.name;
+      return { id: uid(), name: origName, blob: new Blob([e.data], { type: guessMimeFromName(origName) }) };
+    });
+    const album = {
+      id: meta.id,
+      name: meta.name,
+      duration: meta.duration,
+      loop: meta.loop,
+      shuffle: meta.shuffle,
+      images,
+      updatedAt: meta.updatedAt
+    };
+    await dbPut(album);
+    return album;
+  }
+
+  async function syncWithCloud() {
+    if (cloudSyncing) return;
+    cloudSyncing = true;
+    setCloudStatus('syncing…');
+    try {
+      const resp = await cloudFetch('/list?perPage=200&orderBy=name&orderDir=asc');
+      if (!resp.ok) throw new Error('list-failed');
+      const data = await resp.json();
+      const cloudEntries = (data.data || []).filter(f => /^slideshow-.+-\d+\.zip$/.test(f.name));
+      const latestByAlbum = {};
+      cloudEntries.forEach(f => {
+        const m = f.name.match(/^slideshow-(.+)-(\d+)\.zip$/);
+        if (!m) return;
+        const albumId = m[1];
+        const ts = parseInt(m[2], 10);
+        if (!latestByAlbum[albumId] || ts > latestByAlbum[albumId].ts) {
+          latestByAlbum[albumId] = { ts: ts, hash: f.hash };
+        }
+      });
+
+      const localAlbums = await dbGetAll();
+      const localById = Object.fromEntries(localAlbums.map(a => [a.id, a]));
+
+      for (const albumId of Object.keys(latestByAlbum)) {
+        const info = latestByAlbum[albumId];
+        const local = localById[albumId];
+        if (!local || (local.updatedAt || 0) < info.ts) {
+          await restoreAlbumFromCloud(info.hash);
+        }
+      }
+
+      for (const local of localAlbums) {
+        const cloudInfo = latestByAlbum[local.id];
+        if (!cloudInfo || (local.updatedAt || 0) > cloudInfo.ts) {
+          await backupAlbumToCloud(local);
+        }
+      }
+
+      await loadAlbums();
+      setCloudStatus('synced ✓ (private)');
+    } catch (e) {
+      if (e.message === 'no-password') setCloudStatus('not connected — click to set up');
+      else if (e.message === 'bad-password') setCloudStatus('wrong password — click to retry');
+      else { console.error(e); setCloudStatus('sync failed — click to retry'); }
+    } finally {
+      cloudSyncing = false;
+    }
+  }
+
+  let backupDebounceTimer = null;
+  function queueCloudBackup(album) {
+    if (backupDebounceTimer) clearTimeout(backupDebounceTimer);
+    backupDebounceTimer = setTimeout(async () => {
+      setCloudStatus('saving…');
+      const ok = await backupAlbumToCloud(album);
+      setCloudStatus(ok ? 'synced ✓ (private)' : 'save failed — will retry next change');
+    }, 1200);
+  }
 
   let albums = [];
   let currentAlbum = null;
@@ -535,6 +747,7 @@
         });
         if (!ok) return;
         await dbDelete(album.id);
+        deleteAlbumFromCloud(album.id);
         await loadAlbums();
         showToast('Album deleted');
       });
@@ -560,7 +773,7 @@
       images: [],
       updatedAt: Date.now()
     };
-    await dbPut(album, { create: true });
+    await dbPut(album);
     await loadAlbums();
     openAlbum(album.id);
   });
@@ -586,12 +799,6 @@
     thumbGridUrls = [];
   }
 
-  function handleAlbumGone() {
-    if (show && show.style.display === 'block') exitShow();
-    showToast('This album was deleted in another tab.');
-    backToAlbums();
-  }
-
   function backToAlbums() {
     revokeThumbGridUrls();
     viewAlbum.classList.remove('active');
@@ -611,9 +818,9 @@
     if (name === null || !name.trim()) return;
     currentAlbum.name = name.trim();
     currentAlbum.updatedAt = Date.now();
-    try { await dbPut(currentAlbum); }
-    catch (e) { if (e && e.code === 'ALBUM_MISSING') return handleAlbumGone(); showToast('Could not save.'); return; }
+    await dbPut(currentAlbum);
     albumTitle.textContent = currentAlbum.name;
+    queueCloudBackup(currentAlbum);
   });
 
   function renderThumbGrid() {
@@ -640,9 +847,9 @@
       const imgId = btn.dataset.id;
       currentAlbum.images = currentAlbum.images.filter(i => i.id !== imgId);
       currentAlbum.updatedAt = Date.now();
-      try { await dbPut(currentAlbum); }
-      catch (err) { if (err && err.code === 'ALBUM_MISSING') return handleAlbumGone(); showToast('Could not save.'); return; }
+      await dbPut(currentAlbum);
       renderThumbGrid();
+      queueCloudBackup(currentAlbum);
       return;
     }
     const previewImg = e.target.closest('img[data-preview-id]');
@@ -681,12 +888,12 @@
     try {
       await dbPut(currentAlbum);
     } catch (e) {
-      if (e && e.code === 'ALBUM_MISSING') return handleAlbumGone();
       showToast('Could not save — your browser storage may be full.');
       return;
     }
     renderThumbGrid();
     showToast(files.length + ' image' + (files.length === 1 ? '' : 's') + ' added');
+    queueCloudBackup(currentAlbum);
   }
 
   dropZone.addEventListener('click', () => fileInput.click());
@@ -707,8 +914,8 @@
     currentAlbum.loop = loopCheckbox.checked;
     currentAlbum.shuffle = shuffleCheckbox.checked;
     currentAlbum.updatedAt = Date.now();
-    try { await dbPut(currentAlbum); }
-    catch (e) { if (e && e.code === 'ALBUM_MISSING') handleAlbumGone(); }
+    await dbPut(currentAlbum);
+    queueCloudBackup(currentAlbum);
   }
   durationInput.addEventListener('change', saveSettings);
   loopCheckbox.addEventListener('change', saveSettings);
@@ -1015,18 +1222,7 @@
     else if (e.code === 'Escape') exitShow();
   });
 
-  if (channel) {
-    channel.onmessage = async () => {
-      if (!currentAlbum) { loadAlbums(); return; }
-      // An album is open here: check it still exists
-      try {
-        const all = await dbGetAll();
-        if (!all.some(a => a.id === currentAlbum.id)) handleAlbumGone();
-      } catch (e) {}
-    };
-  }
-
-  loadAlbums();
+  loadAlbums().then(() => { syncWithCloud(); });
 })();
 </script>
 </body>
