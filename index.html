@@ -69,6 +69,8 @@
     opacity: 0; transition: opacity 0.15s ease;
   }
   .album-card:hover .album-del { opacity: 1; }
+  /* Touch devices have no hover, so always show the delete button there */
+  @media (hover: none) { .album-del { opacity: 1; } }
 
   .empty-state { text-align: center; padding: 60px 20px; color: var(--muted); font-size: 14px; }
 
@@ -328,13 +330,37 @@
     });
   }
 
-  async function dbPut(album) {
+  // Updates only succeed if the album still exists, so a stale copy (for example
+  // from another open tab) can never resurrect a deleted album.
+  // Pass { create: true } for brand-new or cloud-restored albums.
+  async function dbPut(album, opts) {
+    const create = !!(opts && opts.create);
     const db = await openDB();
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, 'readwrite');
-      tx.objectStore(STORE).put(album);
-      tx.oncomplete = () => resolve();
+      const store = tx.objectStore(STORE);
+      let missing = false;
+      if (create) {
+        store.put(album);
+      } else {
+        const getReq = store.get(album.id);
+        getReq.onsuccess = () => {
+          if (getReq.result) store.put(album);
+          else missing = true;
+        };
+      }
+      tx.oncomplete = () => {
+        if (missing) {
+          const err = new Error('Album was deleted');
+          err.code = 'ALBUM_MISSING';
+          reject(err);
+        } else {
+          notifyOtherTabs();
+          resolve();
+        }
+      };
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
@@ -343,12 +369,30 @@
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, 'readwrite');
       tx.objectStore(STORE).delete(id);
-      tx.oncomplete = () => resolve();
+      tx.oncomplete = () => { notifyOtherTabs(); resolve(); };
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   }
 
+  // Tell other open tabs that data changed so they don't keep working from stale copies.
+  const channel = ('BroadcastChannel' in window) ? new BroadcastChannel('slideshow-albums-sync') : null;
+  function notifyOtherTabs() { try { if (channel) channel.postMessage('changed'); } catch (e) {} }
+
   function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 9); }
+
+  // ---------------- Deleted-album tombstones ----------------
+  // Remember deleted albums so cloud sync can never bring them back, even if the
+  // cloud delete fails, is slow, or another device still has a copy.
+  const TOMBSTONE_KEY = 'deletedAlbums';
+  function getTombstones() {
+    try { return JSON.parse(localStorage.getItem(TOMBSTONE_KEY) || '{}') || {}; }
+    catch (e) { return {}; }
+  }
+  function saveTombstones(t) {
+    try { localStorage.setItem(TOMBSTONE_KEY, JSON.stringify(t)); } catch (e) {}
+  }
+  function isDeleted(id) { return !!getTombstones()[id]; }
 
   // ---------------- Cloud sync (private, via Cloudflare Worker + Drime) ----------------
   const CLOUD_WORKER_URL = 'https://slideshow.scotmorgan621.workers.dev';
@@ -441,22 +485,59 @@
 
   let cloudSyncing = false;
 
+  async function deleteCloudEntries(ids) {
+    if (!ids.length) return true;
+    const resp = await cloudFetch('/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entryIds: ids })
+    });
+    return resp.ok;
+  }
+
+  // Returns true only if the album's cloud backups are gone (or there were none)
   async function deleteAlbumFromCloud(albumId) {
     try {
       const resp = await cloudFetch('/list?perPage=200&orderBy=name&orderDir=asc&query=' + encodeURIComponent('slideshow-' + albumId + '-'));
-      if (!resp.ok) return;
+      if (!resp.ok) return false;
       const data = await resp.json();
       const re = new RegExp('^slideshow-' + albumId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '-(\\d+)\\.zip$');
       const ids = (data.data || []).filter(f => re.test(f.name)).map(f => f.id);
-      if (!ids.length) return;
-      await cloudFetch('/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ entryIds: ids })
-      });
+      return await deleteCloudEntries(ids);
     } catch (e) {
       console.error('Cloud album delete failed', e);
+      return false;
     }
+  }
+
+  // Tiny marker file in the cloud so your other devices also delete this album
+  async function uploadCloudTombstone(albumId, deletedAt) {
+    const blob = await buildZip([{
+      name: '__deleted.json',
+      blob: new Blob([JSON.stringify({ id: albumId, deletedAt: deletedAt })], { type: 'application/json' })
+    }]);
+    const form = new FormData();
+    form.append('file', blob, 'slideshowdel-' + albumId + '-' + deletedAt + '.zip');
+    const resp = await cloudFetch('/upload', { method: 'POST', body: form });
+    return resp.ok;
+  }
+
+  // Remove an album's cloud backups and leave the marker. Retried on every sync until it succeeds.
+  async function purgeAlbumFromCloud(albumId) {
+    const t = getTombstones()[albumId];
+    if (!t || t.cloudDone) return true;
+    try {
+      const removed = await deleteAlbumFromCloud(albumId);
+      const marked = await uploadCloudTombstone(albumId, t.ts);
+      if (removed && marked) {
+        const latest = getTombstones();
+        if (latest[albumId]) { latest[albumId].cloudDone = true; saveTombstones(latest); }
+        return true;
+      }
+    } catch (e) {
+      console.error('Cloud purge failed, will retry on next sync', e);
+    }
+    return false;
   }
 
   async function cleanupOldCloudBackups(albumId) {
@@ -482,8 +563,11 @@
   }
 
   async function backupAlbumToCloud(album) {
+    if (isDeleted(album.id)) return false;
     try {
       const zipBlob = await buildAlbumZipBlob(album);
+      // Deleted while the zip was being built? Don't upload it.
+      if (isDeleted(album.id)) return false;
       const form = new FormData();
       form.append('file', zipBlob, 'slideshow-' + album.id + '-' + album.updatedAt + '.zip');
       const resp = await cloudFetch('/upload', { method: 'POST', body: form });
@@ -511,6 +595,7 @@
       }
     });
     if (!meta) throw new Error('no-meta');
+    if (isDeleted(meta.id)) return null;   // never restore a deleted album
     imageEntries.sort((a, b) => a.name.localeCompare(b.name));
     const images = imageEntries.map(e => {
       const idx = e.name.indexOf('__');
@@ -526,7 +611,8 @@
       images,
       updatedAt: meta.updatedAt
     };
-    await dbPut(album);
+    if (isDeleted(album.id)) return null;  // deleted while downloading
+    await dbPut(album, { create: true });
     return album;
   }
 
@@ -538,11 +624,42 @@
       const resp = await cloudFetch('/list?perPage=200&orderBy=name&orderDir=asc');
       if (!resp.ok) throw new Error('list-failed');
       const data = await resp.json();
-      const cloudEntries = (data.data || []).filter(f => /^slideshow-.+-\d+\.zip$/.test(f.name));
-      const latestByAlbum = {};
-      cloudEntries.forEach(f => {
+      const files = data.data || [];
+
+      // 1. Learn about deletions made on other devices
+      const tombs = getTombstones();
+      files.forEach(f => {
+        const m = f.name.match(/^slideshowdel-(.+)-(\d+)\.zip$/);
+        if (m && !tombs[m[1]]) tombs[m[1]] = { ts: parseInt(m[2], 10), cloudDone: true };
+      });
+      saveTombstones(tombs);
+
+      // 2. Clean up leftover cloud backups of deleted albums, and retry unfinished purges
+      const leftoverIds = [];
+      files.forEach(f => {
         const m = f.name.match(/^slideshow-(.+)-(\d+)\.zip$/);
-        if (!m) return;
+        if (m && tombs[m[1]]) leftoverIds.push(f.id);
+      });
+      if (leftoverIds.length) {
+        try { await deleteCloudEntries(leftoverIds); } catch (e) { console.error(e); }
+      }
+      for (const id of Object.keys(tombs)) {
+        if (!tombs[id].cloudDone) await purgeAlbumFromCloud(id);
+      }
+
+      // 3. Remove local copies of deleted albums
+      let localAlbums = await dbGetAll();
+      for (const a of localAlbums) {
+        if (tombs[a.id]) await dbDelete(a.id);
+      }
+      localAlbums = localAlbums.filter(a => !tombs[a.id]);
+      const localById = Object.fromEntries(localAlbums.map(a => [a.id, a]));
+
+      // 4. Normal two-way sync, skipping anything deleted
+      const latestByAlbum = {};
+      files.forEach(f => {
+        const m = f.name.match(/^slideshow-(.+)-(\d+)\.zip$/);
+        if (!m || tombs[m[1]]) return;
         const albumId = m[1];
         const ts = parseInt(m[2], 10);
         if (!latestByAlbum[albumId] || ts > latestByAlbum[albumId].ts) {
@@ -550,10 +667,8 @@
         }
       });
 
-      const localAlbums = await dbGetAll();
-      const localById = Object.fromEntries(localAlbums.map(a => [a.id, a]));
-
       for (const albumId of Object.keys(latestByAlbum)) {
+        if (isDeleted(albumId)) continue;   // may have been deleted while syncing
         const info = latestByAlbum[albumId];
         const local = localById[albumId];
         if (!local || (local.updatedAt || 0) < info.ts) {
@@ -562,6 +677,7 @@
       }
 
       for (const local of localAlbums) {
+        if (isDeleted(local.id)) continue;
         const cloudInfo = latestByAlbum[local.id];
         if (!cloudInfo || (local.updatedAt || 0) > cloudInfo.ts) {
           await backupAlbumToCloud(local);
@@ -583,6 +699,7 @@
   function queueCloudBackup(album) {
     if (backupDebounceTimer) clearTimeout(backupDebounceTimer);
     backupDebounceTimer = setTimeout(async () => {
+      if (isDeleted(album.id)) return;
       setCloudStatus('saving…');
       const ok = await backupAlbumToCloud(album);
       setCloudStatus(ok ? 'synced ✓ (private)' : 'save failed — will retry next change');
@@ -693,7 +810,11 @@
 
   async function loadAlbums() {
     try {
-      albums = await dbGetAll();
+      const all = await dbGetAll();
+      // Safety net: never show an album that has been deleted, and clean it out of storage
+      const tombs = getTombstones();
+      albums = all.filter(a => !tombs[a.id]);
+      all.filter(a => tombs[a.id]).forEach(a => { dbDelete(a.id).catch(() => {}); });
       albums.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     } catch (e) {
       albums = [];
@@ -746,10 +867,23 @@
           danger: true
         });
         if (!ok) return;
-        await dbDelete(album.id);
-        deleteAlbumFromCloud(album.id);
+
+        // Mark it deleted FIRST, so no sync or pending backup can bring it back
+        const tombs = getTombstones();
+        tombs[album.id] = { ts: Date.now(), cloudDone: false };
+        saveTombstones(tombs);
+
+        try {
+          await dbDelete(album.id);
+        } catch (err) {
+          console.error(err);
+          showToast('Could not delete the album.');
+        }
         await loadAlbums();
         showToast('Album deleted');
+
+        // Background cloud cleanup; retried automatically on the next sync if it fails
+        purgeAlbumFromCloud(album.id);
       });
 
       albumGrid.appendChild(card);
@@ -773,15 +907,15 @@
       images: [],
       updatedAt: Date.now()
     };
-    await dbPut(album);
+    await dbPut(album, { create: true });
     await loadAlbums();
     openAlbum(album.id);
   });
 
   async function openAlbum(id) {
     const fresh = await dbGetAll();
-    currentAlbum = fresh.find(a => a.id === id);
-    if (!currentAlbum) { showToast('Album not found'); return; }
+    currentAlbum = fresh.find(a => a.id === id && !isDeleted(a.id));
+    if (!currentAlbum) { showToast('Album not found'); loadAlbums(); return; }
 
     viewAlbums.classList.remove('active');
     viewAlbum.classList.add('active');
@@ -808,6 +942,13 @@
   }
   backBtn.addEventListener('click', backToAlbums);
 
+  // Called when the open album turns out to have been deleted (e.g. in another tab)
+  function handleAlbumGone() {
+    if (show && show.style.display === 'block') exitShow();
+    showToast('This album was deleted.');
+    backToAlbums();
+  }
+
   albumTitle.addEventListener('click', async () => {
     const name = await openModal({
       title: 'Rename album',
@@ -818,7 +959,12 @@
     if (name === null || !name.trim()) return;
     currentAlbum.name = name.trim();
     currentAlbum.updatedAt = Date.now();
-    await dbPut(currentAlbum);
+    try { await dbPut(currentAlbum); }
+    catch (e) {
+      if (e && e.code === 'ALBUM_MISSING') return handleAlbumGone();
+      showToast('Could not save.');
+      return;
+    }
     albumTitle.textContent = currentAlbum.name;
     queueCloudBackup(currentAlbum);
   });
@@ -847,7 +993,12 @@
       const imgId = btn.dataset.id;
       currentAlbum.images = currentAlbum.images.filter(i => i.id !== imgId);
       currentAlbum.updatedAt = Date.now();
-      await dbPut(currentAlbum);
+      try { await dbPut(currentAlbum); }
+      catch (err) {
+        if (err && err.code === 'ALBUM_MISSING') return handleAlbumGone();
+        showToast('Could not save.');
+        return;
+      }
       renderThumbGrid();
       queueCloudBackup(currentAlbum);
       return;
@@ -888,6 +1039,7 @@
     try {
       await dbPut(currentAlbum);
     } catch (e) {
+      if (e && e.code === 'ALBUM_MISSING') return handleAlbumGone();
       showToast('Could not save — your browser storage may be full.');
       return;
     }
@@ -914,7 +1066,12 @@
     currentAlbum.loop = loopCheckbox.checked;
     currentAlbum.shuffle = shuffleCheckbox.checked;
     currentAlbum.updatedAt = Date.now();
-    await dbPut(currentAlbum);
+    try { await dbPut(currentAlbum); }
+    catch (e) {
+      if (e && e.code === 'ALBUM_MISSING') return handleAlbumGone();
+      showToast('Could not save.');
+      return;
+    }
     queueCloudBackup(currentAlbum);
   }
   durationInput.addEventListener('change', saveSettings);
@@ -1221,6 +1378,18 @@
     else if (e.code === 'ArrowLeft') advance(-1);
     else if (e.code === 'Escape') exitShow();
   });
+
+  // Keep other open tabs in sync with changes made in this one
+  if (channel) {
+    channel.onmessage = async () => {
+      if (!currentAlbum) { loadAlbums(); return; }
+      // An album is open in this tab: make sure it still exists
+      try {
+        const all = await dbGetAll();
+        if (!all.some(a => a.id === currentAlbum.id) || isDeleted(currentAlbum.id)) handleAlbumGone();
+      } catch (e) {}
+    };
+  }
 
   loadAlbums().then(() => { syncWithCloud(); });
 })();
